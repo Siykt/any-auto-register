@@ -5,6 +5,8 @@ OAuth 客户端模块 - 处理 Codex OAuth 登录流程
 import time
 import secrets
 import uuid
+import json
+import random
 from urllib.parse import urlparse, parse_qs
 from core.proxy_utils import build_requests_proxy_config
 from core.task_runtime import TaskInterruption
@@ -77,6 +79,79 @@ class OAuthClient:
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    @staticmethod
+    def _random_chrome_fingerprint():
+        profiles = [
+            {
+                "major": 131,
+                "impersonate": "chrome131",
+                "build": 6778,
+                "patch_range": (69, 205),
+                "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            },
+            {
+                "major": 133,
+                "impersonate": "chrome133a",
+                "build": 6943,
+                "patch_range": (33, 153),
+                "sec_ch_ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+            },
+            {
+                "major": 136,
+                "impersonate": "chrome136",
+                "build": 7103,
+                "patch_range": (48, 175),
+                "sec_ch_ua": '"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"',
+            },
+        ]
+        profile = random.choice(profiles)
+        major = profile["major"]
+        build = profile["build"]
+        patch = random.randint(*profile["patch_range"])
+        full_ver = f"{major}.0.{build}.{patch}"
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            f"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{full_ver} Safari/537.36"
+        )
+        return ua, profile["sec_ch_ua"], profile["impersonate"]
+
+    def _ensure_oauth_fingerprint(self, user_agent, sec_ch_ua, impersonate):
+        if user_agent and sec_ch_ua and impersonate:
+            return user_agent, sec_ch_ua, impersonate
+
+        ua, ch_ua, imp = self._random_chrome_fingerprint()
+        user_agent = user_agent or ua
+        sec_ch_ua = sec_ch_ua or ch_ua
+        impersonate = impersonate or imp
+
+        try:
+            self.session.headers.update(
+                {
+                    "User-Agent": user_agent,
+                    "Accept-Language": random.choice(
+                        [
+                            "en-US,en;q=0.9",
+                            "en-US,en;q=0.9,zh-CN;q=0.8",
+                            "en,en-US;q=0.9",
+                            "en-US,en;q=0.8",
+                        ]
+                    ),
+                    "sec-ch-ua": sec_ch_ua,
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "sec-ch-ua-arch": '"x86"',
+                    "sec-ch-ua-bitness": '"64"',
+                }
+            )
+        except Exception:
+            pass
+
+        self._log(
+            f"OAuth 指纹: ua={user_agent.split('Chrome/')[-1][:24]}..., sec-ch-ua={sec_ch_ua}, impersonate={impersonate}"
+        )
+        return user_agent, sec_ch_ua, impersonate
+
 
     @staticmethod
     def _iter_text_fragments(value):
@@ -970,6 +1045,19 @@ class OAuthClient:
                 data,
                 current_url=str(r.url) or request_url,
             )
+            if self._state_is_add_phone(flow_state):
+                try:
+                    raw_text = r.text or ""
+                except Exception:
+                    raw_text = ""
+                try:
+                    raw_json = json.dumps(data, ensure_ascii=False)
+                except Exception:
+                    raw_json = ""
+                if raw_text:
+                    self._log("add_phone 触发响应体(raw): " + raw_text)
+                if raw_json and raw_json != raw_text:
+                    self._log("add_phone 触发响应体(json): " + raw_json)
             self._log(f"about_you 提交成功 {describe_flow_state(flow_state)}")
             return flow_state
         except Exception as e:
@@ -1002,6 +1090,7 @@ class OAuthClient:
         last_name="",
         birthdate="",
         login_source="",
+        stop_after_login=False,
         _recovery_depth=0,
     ):
         """
@@ -1044,7 +1133,8 @@ class OAuthClient:
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
-            f"screen_hint={screen_hint or 'login'}"
+            f"screen_hint={screen_hint or 'login'}, "
+            f"stop_after_login={'on' if stop_after_login else 'off'}"
         )
 
         if force_new_browser:
@@ -1056,6 +1146,10 @@ class OAuthClient:
             if not device_id:
                 device_id = str(uuid.uuid4())
                 self._log(f"OAuth device_id 缺失，已生成新的 device_id={device_id}")
+
+        user_agent, sec_ch_ua, impersonate = self._ensure_oauth_fingerprint(
+            user_agent, sec_ch_ua, impersonate
+        )
 
         code_verifier, code_challenge = generate_pkce()
         oauth_state = secrets.token_urlsafe(32)
@@ -1121,6 +1215,17 @@ class OAuthClient:
         seen_states = {}
         referer = continue_referer
 
+        def _should_stop_after_login(state_to_check: FlowState):
+            if not stop_after_login:
+                return False
+            if self._state_is_login_password(state_to_check):
+                return False
+            if self._state_is_email_otp(state_to_check):
+                return False
+            if self._state_is_create_account_password(state_to_check):
+                return False
+            return True
+
         for step in range(20):
             self.last_state = state
             self._log(f"状态步进[{step + 1}/20]: {describe_flow_state(state)}")
@@ -1174,6 +1279,13 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("密码验证后未进入下一步 OAuth 状态")
                     return None
+                if _should_stop_after_login(next_state):
+                    self._log(
+                        "登录链路已完成（密码验证后进入下一状态），按要求停止"
+                    )
+                    self.last_state = next_state
+                    self._set_error("登录链路已完成，按要求停止")
+                    return None
                 referer = state.current_url or referer
                 state = next_state
                 continue
@@ -1190,6 +1302,13 @@ class OAuthClient:
                 if not next_state:
                     if not self.last_error:
                         self._set_error("密码验证后未进入下一步 OAuth 状态")
+                    return None
+                if _should_stop_after_login(next_state):
+                    self._log(
+                        "登录链路已完成（密码验证后进入下一状态），按要求停止"
+                    )
+                    self.last_state = next_state
+                    self._set_error("登录链路已完成，按要求停止")
                     return None
                 referer = state.current_url or referer
                 state = next_state
@@ -1239,6 +1358,13 @@ class OAuthClient:
                     if not self.last_error:
                         self._set_error("邮箱 OTP 验证后未进入下一步 OAuth 状态")
                     return None
+                if _should_stop_after_login(next_state):
+                    self._log(
+                        "登录链路已完成（OTP 验证后进入下一状态），按要求停止"
+                    )
+                    self.last_state = next_state
+                    self._set_error("登录链路已完成，按要求停止")
+                    return None
                 referer = state.current_url or referer
                 state = next_state
                 continue
@@ -1264,6 +1390,12 @@ class OAuthClient:
                 continue
 
             if self._state_is_add_phone(state):
+                try:
+                    raw_dump = json.dumps(state.raw or {}, ensure_ascii=False)
+                except Exception:
+                    raw_dump = ""
+                if raw_dump:
+                    self._log(f"add_phone 状态响应体(raw): {raw_dump}")
                 if not allow_phone_verification:
                     if self._state_supports_workspace_resolution(state):
                         self._log(
@@ -2276,3 +2408,4 @@ class OAuthClient:
                 f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s"
             )
         return None
+
